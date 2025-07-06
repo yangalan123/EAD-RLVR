@@ -54,6 +54,7 @@ from verl import DataProto
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 from verl.workers.rollout.base import BaseRollout
+from verl.workers.rollout.vllm_rollout.annealed_sampling import annealed_sampling_processor
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -195,6 +196,31 @@ class vLLMRollout(BaseRollout):
             if hasattr(SamplingParams(), str(k)):
                 kwargs[k] = config.get(k)
 
+        if hasattr(config, 'annealed_sampling') and config.annealed_sampling is not None:
+            annealed_config = config.annealed_sampling
+            # Check if annealed sampling is enabled
+            if annealed_config.get('enable', False):
+                exploration_temp = annealed_config.get('exploration_temp', 1.0)
+                stability_temp = annealed_config.get('stability_temp', 0.1)
+                decay_freq = annealed_config.get('decay_freq', 50)
+                decay_mode = annealed_config.get('decay_mode', 'both')
+                warmup_period = annealed_config.get('warmup_period', 10)
+                decay_freq_increase_factor = annealed_config.get('decay_freq_increase_factor', 5)
+                
+                # Create and apply the annealed sampling monkey patch
+                annealed_logits_processor = lambda token_ids, logits: annealed_sampling_processor(
+                    token_ids=token_ids,
+                    logits=logits,
+                    exploration_temp=exploration_temp,
+                    stability_temp=stability_temp,
+                    decay_freq=decay_freq,
+                    global_step=kwargs.get('global_step', 0),
+                    decay_mode=decay_mode,
+                    warmup_period=warmup_period,
+                    decay_freq_increase_factor=decay_freq_increase_factor
+                )
+                kwargs["logits_processors"] = [annealed_logits_processor]
+
         print(f"kwargs: {kwargs}")
         self.sampling_params = SamplingParams(**kwargs)
 
@@ -308,8 +334,45 @@ class vLLMRollout(BaseRollout):
                     LoRARequest(lora_name=f"{lora_int_id}", lora_int_id=lora_int_id, lora_path="/simon-stub-path")
                 ] * batch_size
 
+        # Get global step from meta_info if available
+        global_step = prompts.meta_info.get("global_step", 0)
+
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
+            # Update sampling params with global step for annealed sampling
+            if hasattr(self.config, 'annealed_sampling') and self.config.annealed_sampling is not None:
+                annealed_config = self.config.annealed_sampling
+                if annealed_config.get('enable', False):
+                    # Update the logits processor with current global step
+                    exploration_temp = annealed_config.get('exploration_temp', 1.0)
+                    stability_temp = annealed_config.get('stability_temp', 0.1)
+                    decay_freq = annealed_config.get('decay_freq', 50)
+                    decay_mode = annealed_config.get('decay_mode', 'both')
+                    warmup_period = annealed_config.get('warmup_period', 10)
+                    adaptive_decay = annealed_config.get('adaptive_decay', False)
+                    
+                    # Get UIDs for adaptive decay if needed
+                    uids = None
+                    if adaptive_decay and decay_mode == 'adaptive':
+                        uids = prompts.non_tensor_batch.get('uid', None)
+                        if uids is None:
+                            print("Warning: UIDs not found for adaptive decay, falling back to standard mode")
+                            adaptive_decay = False
+                    
+                    annealed_logits_processor = lambda token_ids, logits: annealed_sampling_processor(
+                        token_ids=token_ids,
+                        logits=logits,
+                        exploration_temp=exploration_temp,
+                        stability_temp=stability_temp,
+                        decay_freq=decay_freq,
+                        global_step=global_step,
+                        decay_mode=decay_mode,
+                        warmup_period=warmup_period,
+                        adaptive_decay=adaptive_decay,
+                        uid=uids[0] if uids is not None else None  # For now, use first UID as placeholder
+                    )
+                    self.sampling_params.logits_processors = [annealed_logits_processor]
+
             outputs = self.inference_engine.generate(
                 prompts=vllm_inputs,  # because we have already convert it to prompt token id
                 sampling_params=self.sampling_params,

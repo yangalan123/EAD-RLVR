@@ -217,6 +217,9 @@ actor_rollout_ref:
     # Whether to use KL loss instead of KL reward penalty. True for GRPO
     use_kl_loss: false
 
+    # whether to apply the truncated Importance Sampling (-1 for no importance sampling)
+    imp_ratio_cap: -1
+
     # Whether to use torch.compile()
     use_torch_compile: true
 
@@ -584,6 +587,39 @@ actor_rollout_ref:
 
         # Class name of the custom async server class (e.g. AsyncvLLMServer)
         name: null
+
+    # [Experimental] Annealed sampling configuration
+    annealed_sampling:
+
+      # Whether to enable annealed sampling (default: False)
+      enable: False
+
+      # Exploration temperature for annealed sampling
+      exploration_temp: 1.0
+
+      # Stability temperature for annealed sampling
+      stability_temp: 0.1
+
+      # Decay frequency for annealed sampling
+      decay_freq: 50
+
+      # Decay mode for annealed sampling. Options: 'global_step', 'token_length', 'both', 'none', 'adaptive'.
+      decay_mode: both
+
+      # Warmup period: if output length is less than this, do not apply annealing (default: 10)
+      warmup_period: 10
+
+      # Factor by which decay_freq increases with global_step (default: 5)
+      decay_freq_increase_factor: 5
+
+      # Whether to enable adaptive decay based on historical performance (default: False)
+      adaptive_decay: False
+
+      # Whether to apply temperature correction for old policy log probability computation (default: False)
+      # When enabled, old_log_prob computation will use the same annealed temperature scaling
+      # as used during generation, providing an alternative to imp_ratio_cap for importance ratio correction
+      old_policy_temperature_correction: False
+
 
 # configs for the critic
 critic:
@@ -1022,6 +1058,9 @@ trainer:
 
   # Validation frequency (in training iterations)
   test_freq: -1
+
+  # Directory for storing annealing historical data cache (optional)
+  annealing_cache_dir: null
 
   # Number of iterations to warm up the critic before updating policy
   critic_warmup: 0

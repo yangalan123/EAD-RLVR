@@ -79,8 +79,55 @@ class DataParallelPPOActor(BasePPOActor):
         )
         self.device_name = get_device_name()
 
+    def _compute_annealed_temperature_for_response(self, response_length: int, global_step: int, 
+                                                 exploration_temp: float, stability_temp: float, 
+                                                 decay_freq: int, decay_mode: str, warmup_period: int = 10) -> torch.Tensor:
+        """
+        Compute annealed temperature for response tokens only (memory efficient).
+        
+        Args:
+            response_length: Length of the response sequence
+            global_step: Current global optimization step
+            exploration_temp: Exploration temperature (T_max)
+            stability_temp: Stability temperature (T_min)
+            decay_freq: Decay frequency (d_0)
+            decay_mode: Decay mode (only 'negexp' is implemented here)
+            warmup_period: Warmup period (c)
+            
+        Returns:
+            Tensor of shape [response_length] containing temperature for each response token position
+        """
+        if decay_mode == "negexp":
+            # Implement the negexp formula: T_t = max{1 + T_max - e^{t/d_s}, T_min} for t >= c, else 1.0
+            # where d_s = min(d_0 + 5s, 40000)
+            # Note: t is the relative position within the response, not absolute position in full sequence
+            
+            # Calculate d_s based on global step
+            d_s = min(decay_freq + 5 * global_step, 40000)
+            
+            # Create response positions: t = [0, 1, 2, ..., response_length-1]
+            # These are relative positions within the response
+            response_positions = torch.arange(response_length, dtype=torch.float32)
+            
+            # Apply the formula
+            # For t < c (warmup_period): T_t = 1.0
+            # For t >= c: T_t = max{1 + T_max - e^{t/d_s}, T_min}
+            temperatures = torch.where(
+                response_positions < warmup_period,
+                torch.tensor(1.0),  # T_t = 1.0 for t < c
+                torch.maximum(
+                    torch.tensor(1.0 + exploration_temp) - torch.exp(response_positions / d_s),
+                    torch.tensor(stability_temp)
+                )
+            )
+            
+            return temperatures
+        else:
+            # For other decay modes, return constant temperature (not implemented yet)
+            return torch.full((response_length,), exploration_temp, dtype=torch.float32)
+
     def _forward_micro_batch(
-        self, micro_batch, temperature, calculate_entropy=False
+        self, micro_batch, temperature, calculate_entropy=False, per_token_temps=None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Returns:
@@ -162,7 +209,9 @@ class DataParallelPPOActor(BasePPOActor):
 
                 # only pass input_ids and position_ids to enable flash_attn_varlen
                 extra_args = {}
-                if self.use_fused_kernels:
+                if self.use_fused_kernels and per_token_temps is None:
+                    # Only use fused kernels when we don't have per-token temperatures
+                    # Fused kernels don't support per-token temperature scaling
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
 
@@ -175,13 +224,23 @@ class DataParallelPPOActor(BasePPOActor):
                     **extra_args,
                 )  # prevent model thinks we are generating
 
-                if self.use_fused_kernels:
+                if self.use_fused_kernels and per_token_temps is None:
                     log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
                     entropy_rmpad = output.entropy.squeeze(0)  # (total_nnz,)
 
                 else:
                     logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
-                    logits_rmpad.div_(temperature)
+                    # Apply temperature scaling - use per-token temperatures if available
+                    if per_token_temps is not None:
+                        # per_token_temps is (response_length,) - repeat for each batch item
+                        batch_size = logits_rmpad.size(0) // response_length
+                        response_temps_expanded = per_token_temps.unsqueeze(0).expand(batch_size, -1)  # (batch_size, response_length)
+                        response_temps_flat = response_temps_expanded.reshape(-1)  # (total_nnz,)
+                        
+                        # Apply per-token temperature scaling
+                        logits_rmpad.div_(response_temps_flat.unsqueeze(-1))  # Broadcast to vocab_size
+                    else:
+                        logits_rmpad.div_(temperature)
 
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                     inplace_backward = True
@@ -240,7 +299,9 @@ class DataParallelPPOActor(BasePPOActor):
 
             else:  # not using rmpad and no ulysses sp
                 extra_args = {}
-                if self.use_fused_kernels:
+                if self.use_fused_kernels and per_token_temps is None:
+                    # Only use fused kernels when we don't have per-token temperatures
+                    # Fused kernels don't support per-token temperature scaling
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
 
@@ -253,14 +314,22 @@ class DataParallelPPOActor(BasePPOActor):
                     **extra_args,
                 )  # prevent model thinks we are generating
 
-                if self.use_fused_kernels:
+                if self.use_fused_kernels and per_token_temps is None:
                     log_probs = output.log_probs[:, -response_length - 1 : -1]
                     entropy = output.entropy[:, -response_length - 1 : -1]  # (bsz, response_length)
 
                 else:
                     logits = output.logits
 
-                    logits.div_(temperature)
+                    # Apply temperature scaling - use per-token temperatures if available
+                    if per_token_temps is not None:
+                        # per_token_temps is (response_length,) - expand to match logits shape
+                        # logits shape: (batch_size, response_length, vocab_size)
+                        batch_size = logits.size(0)
+                        temp_expanded = per_token_temps.unsqueeze(0).unsqueeze(-1).expand(batch_size, -1, -1)
+                        logits.div_(temp_expanded)
+                    else:
+                        logits.div_(temperature)
                     logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
                     log_probs = logprobs_from_logits(logits, micro_batch["responses"])
                     if calculate_entropy:
@@ -305,9 +374,13 @@ class DataParallelPPOActor(BasePPOActor):
 
                 ``responses``:  tensor of shape [batch_size, response_length]. torch.int64.
 
+
         Returns:
             torch.Tensor: the log_prob tensor
         """
+        # Read old_policy from meta_info for temperature scaling in annealed sampling
+        old_policy = data.meta_info.get("old_policy", False)
+        
         # set to eval
         self.actor_module.eval()
 
@@ -351,6 +424,32 @@ class DataParallelPPOActor(BasePPOActor):
 
         micro_batches, indices = _get_micro_batches(data)
 
+        # Compute annealed temperatures for old policy if needed
+        per_token_temps = None
+        if old_policy and hasattr(self.config, 'annealed_sampling') and self.config.annealed_sampling is not None:
+            annealed_config = self.config.annealed_sampling
+            if annealed_config.get('enable', False) and annealed_config.get('old_policy_temperature_correction', False):
+                # Get global step from meta_info
+                global_step = data.meta_info.get("global_step", 0)
+                
+                # Get annealed sampling parameters
+                exploration_temp = annealed_config.get('exploration_temp', 1.0)
+                stability_temp = annealed_config.get('stability_temp', 0.1)
+                decay_freq = annealed_config.get('decay_freq', 50)
+                decay_mode = annealed_config.get('decay_mode', 'negexp')  # Only support negexp for now
+                warmup_period = annealed_config.get('warmup_period', 10)
+                
+                # Get response length from the data
+                responses = data.batch["responses"]
+                response_length = responses.size(1)  # response_length
+                
+                # Compute annealed temperatures for response tokens only (memory efficient)
+                # Using relative positions within the response
+                per_token_temps = self._compute_annealed_temperature_for_response(
+                    response_length, global_step, exploration_temp, stability_temp, 
+                    decay_freq, decay_mode, warmup_period
+                )
+
         log_probs_lst = []
         entropy_lst = []
         for micro_batch in micro_batches:
@@ -358,7 +457,8 @@ class DataParallelPPOActor(BasePPOActor):
                 micro_batch = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
                 entropy, log_probs = self._forward_micro_batch(
-                    micro_batch, temperature=temperature, calculate_entropy=calculate_entropy
+                    micro_batch, temperature=temperature, calculate_entropy=calculate_entropy,
+                    per_token_temps=per_token_temps
                 )
             log_probs_lst.append(log_probs)
             if calculate_entropy:
@@ -396,6 +496,13 @@ class DataParallelPPOActor(BasePPOActor):
         ]
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
+        if self.config.imp_ratio_cap > 0:
+            assert "rollout_log_probs" in data.batch.keys(), (
+                "Truncated Importance Sampling (TIS) requires to configure "
+                "`actor_rollout_ref.rollout.calculate_log_probs=True` "
+                "and is not currently supported in Server mode (agent loop)."
+            )
+            select_keys.append("rollout_log_probs")
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
 
@@ -471,6 +578,7 @@ class DataParallelPPOActor(BasePPOActor):
                         data = data.to(get_device_id())  # actor device is cpu when using offload
                     response_mask = data["response_mask"]
                     old_log_prob = data["old_log_probs"]
+                    rollout_log_probs = data["rollout_log_probs"] if "rollout_log_probs" in data else None
                     advantages = data["advantages"]
 
                     clip_ratio = self.config.clip_ratio
@@ -505,6 +613,8 @@ class DataParallelPPOActor(BasePPOActor):
                             cliprange_high=clip_ratio_high,
                             clip_ratio_c=clip_ratio_c,
                             loss_agg_mode=loss_agg_mode,
+                            rollout_log_probs=rollout_log_probs,
+                            imp_ratio_cap=self.config.imp_ratio_cap,
                         )
 
                     else:
