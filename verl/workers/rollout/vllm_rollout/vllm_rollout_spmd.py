@@ -349,16 +349,6 @@ class vLLMRollout(BaseRollout):
                     decay_freq = annealed_config.get('decay_freq', 50)
                     decay_mode = annealed_config.get('decay_mode', 'both')
                     warmup_period = annealed_config.get('warmup_period', 10)
-                    adaptive_decay = annealed_config.get('adaptive_decay', False)
-                    
-                    # Get UIDs for adaptive decay if needed
-                    uids = None
-                    if adaptive_decay and decay_mode == 'adaptive':
-                        uids = prompts.non_tensor_batch.get('uid', None)
-                        if uids is None:
-                            print("Warning: UIDs not found for adaptive decay, falling back to standard mode")
-                            adaptive_decay = False
-                    
                     annealed_logits_processor = lambda token_ids, logits: annealed_sampling_processor(
                         token_ids=token_ids,
                         logits=logits,
@@ -367,9 +357,7 @@ class vLLMRollout(BaseRollout):
                         decay_freq=decay_freq,
                         global_step=global_step,
                         decay_mode=decay_mode,
-                        warmup_period=warmup_period,
-                        adaptive_decay=adaptive_decay,
-                        uid=uids[0] if uids is not None else None  # For now, use first UID as placeholder
+                        warmup_period=warmup_period
                     )
                     self.sampling_params.logits_processors = [annealed_logits_processor]
 

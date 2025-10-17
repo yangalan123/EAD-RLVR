@@ -612,8 +612,6 @@ actor_rollout_ref:
       # Factor by which decay_freq increases with global_step (default: 5)
       decay_freq_increase_factor: 5
 
-      # Whether to enable adaptive decay based on historical performance (default: False)
-      adaptive_decay: False
 
       # Whether to apply temperature correction for old policy log probability computation (default: False)
       # When enabled, old_log_prob computation will use the same annealed temperature scaling
@@ -1059,8 +1057,6 @@ trainer:
   # Validation frequency (in training iterations)
   test_freq: -1
 
-  # Directory for storing annealing historical data cache (optional)
-  annealing_cache_dir: null
 
   # Number of iterations to warm up the critic before updating policy
   critic_warmup: 0

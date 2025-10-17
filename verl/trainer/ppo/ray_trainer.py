@@ -1279,41 +1279,6 @@ class RayPPOTrainer:
                             config=self.config.algorithm,
                         )
 
-                        # Update historical data for adaptive annealing
-                        if (hasattr(self.config.actor_rollout_ref.rollout, 'annealed_sampling') and 
-                            self.config.actor_rollout_ref.rollout.annealed_sampling.get('enable', False) and
-                            self.config.actor_rollout_ref.rollout.annealed_sampling.get('adaptive_decay', False)):
-                            
-                            from verl.workers.rollout.vllm_rollout.annealed_sampling import get_historical_manager
-                            
-                            # Get historical manager
-                            cache_dir = self.config.trainer.get('annealing_cache_dir', None)
-                            historical_manager = get_historical_manager(cache_dir=cache_dir)
-                            
-                            # Extract data for historical update
-                            uids = batch.non_tensor_batch.get('uid', None)
-                            if uids is not None:
-                                # Calculate token lengths (response lengths)
-                                response_mask = batch.batch['response_mask']
-                                token_lengths = response_mask.sum(dim=-1).cpu().numpy()
-                                
-                                # Get advantages (mean over sequence)
-                                advantages = batch.batch['advantages']
-                                mean_advantages = (advantages * response_mask).sum(dim=-1) / response_mask.sum(dim=-1)
-                                mean_advantages = mean_advantages.cpu().numpy()
-                                
-                                # Get log probabilities (mean over sequence)
-                                old_log_probs = batch.batch['old_log_probs']
-                                mean_log_probs = (old_log_probs * response_mask).sum(dim=-1) / response_mask.sum(dim=-1)
-                                mean_log_probs = mean_log_probs.cpu().numpy()
-                                
-                                # Update historical data
-                                historical_manager.update_history(
-                                    uids=uids,
-                                    token_lengths=token_lengths,
-                                    advantages=mean_advantages,
-                                    log_probs=mean_log_probs
-                                )
 
                     # update critic
                     if self.use_critic:
